@@ -1,0 +1,246 @@
+Stephen's notes on how this bloody thing works.
+
+BAP provides the front-end of the tool. The whole thing is driven
+by a shell script, synthesize_dwarf.sh
+
+function bap_synth {
+    timer_arg=""
+    if [ -n "$TIMERS" ]; then
+        timer_arg='--dwarfsynth-timers'
+    fi
+    # `--no-optimization`: it's actually faster without
+    bap "$INPUT_FILE" \
+        $timer_arg \
+        --no-optimization \
+        --no-byteweight -p dwarfsynth \
+        --dwarfsynth-output "$TMP_DIR/marshal" $BAP_ARGS \
+        > /dev/null
+    return $?
+}
+
+We have a BAP pass called 'main' (see dwarfsynth.ml).
+BAP's notion of 'project' is used. What's a project?
+It's a "disassembled program".
+https://binaryanalysisplatform.github.io/bap/api/master/bap/Bap/Std/Project/index.html
+
+
+  let () = Cnf.(
+      when_ready ((fun {get=(!!)} ->
+          Bap.Std.Project.register_pass' (main
+                                            ~no_rbp_undef:!!no_rbp_undef
+                                            ~timers:!!timers
+                                            !!outfile )))
+    )
+
+The primed version -- register_pass' -- returns unit, whereas
+    the normal version is project -> project
+
+Our pass is defined in Main.ml:
+
+let main
+    ?no_rbp_undef:(no_rbp_undef=false)
+    ?timers:(timers=false)
+    outfile
+    proj =
+
+  let pre_dwarf = proj
+                  |> Simplest.of_proj no_rbp_undef timers
+                  |> Simplest.clean_lost_track_subs
+
+... so it has two parts prior to generating output: "of_proj" and "clean_lost_track_subs".
+
+"of_proj" is a thin wrapper around "of_prog":
+
+...
+  let prog = BStd.Project.program proj in
+  let sub_ranges = build_sub_ranges prog in
+  let next_instr_graph =
+    build_next_instr sub_ranges (BStd.Project.disasm proj) in
+  let result = of_prog prog next_instr_graph in
+...
+
+so we have three sub-parts: "build_sub_ranges" and "build_next_instr" and "of_prog"
+
+let build_sub_ranges prog: (memory_address) AddrMap.t =
+  (** Builds a map mapping the first address of each subroutine to its last
+      address. This map can be interpreted as a list of address ranges with
+      easy fast access to a member (cf Map.S.find_first) *)
+... pretty boring fold
+
+let build_next_instr sub_ranges (disasm: BStd.disasm): AddrSet.t AddrMap.t =
+  (** Build a map of memory_address -> AddrSet.t holding, for each address, the
+      set of instructions coming right after the instruction at given address.
+      There might be multiple such addresses, if the current instruction is at
+      a point of branching.  *)
+... again boring
+
+The main work seems to be in:
+
+let of_prog prog next_instr_graph : subroutine_cfa_map =
+  (** Extracts the `cfa_changes` of a program *)
+  let fold_step accu sub =
+    (try
+       (match is_ghost_sub sub with
+        | true -> accu
+        | false ->
+          let subroutine_data = process_sub sub next_instr_graph in
+          StrMap.add (BStd.Sub.name sub) subroutine_data accu
+       )
+     with
+     | InvalidSub -> accu
+     | Inconsistent tid ->
+       Format.eprintf "Inconsistent TId %a in subroutine %s, skipping.@."
+         BStd.Tid.pp tid (BStd.Sub.name sub);
+       accu
+    )
+  in
+  let subroutines = BStd.Term.enum BStd.sub_t prog in
+  BStd.Seq.fold subroutines
+    ~init:StrMap.empty
+    ~f:fold_step
+
+and (*** this is the most important bit ***)
+
+  (** Extracts the `cfa_changes_fde` of a subroutine *)
+
+  let cfg = BStd.Sub.to_cfg sub in
+
+  let first_bap_addr = addr_of sub in
+  let first_addr = to_int64_addr first_bap_addr in
+  let last_addr = find_last_addr sub in
+
+  let initial_cfa_rsp_offset = Int64.of_int 8 in
+
+  let entry_blk = get_entry_blk cfg (first_bap_addr) in  (* entry is the lowest-addressed block *)
+  let rbp_pop_set = find_rbp_pop_set cfg entry_blk in (* <-- this is quite complex:
+                                                        find instructions after which
+                                                        rbp should show as 'u' in the CFA info  *)
+  let rec dfs_process
+      allow_rbp
+      (sub_changes: (reg_changes_fde * reg_pos) TIdMap.t)
+      node
+      (entry_offset: reg_pos) =
+    (** Processes one block *)
+
+    let cur_blk = CFG.Node.label node in
+    let tid = BStd.Term.tid @@ cur_blk in
+
+    let compute_block_and_update entry_offset sub_changes =
+      let cur_blk_changes, end_reg =
+        process_blk next_instr_graph rbp_pop_set
+          allow_rbp entry_offset cur_blk in
+      let n_sub_changes =
+        TIdMap.add tid (cur_blk_changes, entry_offset) sub_changes in
+      n_sub_changes, end_reg
+    in
+
+
+    match (TIdMap.find_opt tid sub_changes) with
+    | None ->
+      (* Not yet visited: compute the changes *)
+      let n_sub_changes, end_reg =
+        compute_block_and_update entry_offset sub_changes in
+
+      BStd.Seq.fold (CFG.Node.succs node cfg)
+        ~f:(fun accu child ->
+            (match entrypoint_address (CFG.Node.label child) with
+             | Some x when x < first_bap_addr -> accu
+             | _ -> dfs_process allow_rbp accu child end_reg)
+            )
+
+        ~init:n_sub_changes
+    | Some (_, former_entry_offset) ->
+      (* Already visited: check that entry values are matching *)
+
+      let do_fail () =
+         if allow_rbp then
+           Format.eprintf "Found inconsistency (0x%Lx <%a>): %a -- %a@."
+             (int64_addr_of cur_blk)
+             BStd.Tid.pp tid
+             pp_reg_pos entry_offset pp_reg_pos former_entry_offset ;
+         raise (Inconsistent tid)
+      in
+
+      (match valid_merge former_entry_offset entry_offset with
+       | Valid_merge -> sub_changes
+
+       | Invalid_merge -> do_fail ()
+       | Valid_with_rbp_erasing _ ->
+         (* Valid only if we manage to set back %rbp to undef in this block and
+            propagate the changes.
+            This tends to happen mostly in leaf blocks of a function (just
+            before a return), so we only handle the case for those blocks, in
+            which case there is no propagation needed.
+            The easy way to do this is simply to re-synthesize the block.
+         *)
+         let out_degree = CFG.Node.degree ~dir:`Out node cfg in
+         (match out_degree with
+          | 0 ->
+            let n_sub_changes, _ =
+              compute_block_and_update entry_offset sub_changes in
+            n_sub_changes
+          | _ ->
+            do_fail ()
+         )
+      )
+  in
+
+  let with_rbp_if_needed initial_offset =
+    (* Tries first without allowing CFA=rbp+k, then allowing it if the first
+       result was either inconsistent or lost track *)
+    let not_losing_track synth_result =
+      let lost_track = TIdMap.exists
+          (fun _ (_, (cfa_pos, _)) -> match cfa_pos with
+             | CfaLostTrack -> true
+             | _ -> false) synth_result
+      in
+      (match lost_track with
+       | true -> None
+       | false -> Some synth_result)
+    in
+    let without_rbp =
+      (try
+         dfs_process false TIdMap.empty entry_blk initial_offset
+         |> not_losing_track
+       with Inconsistent _ -> None
+      )
+    in
+    (match without_rbp with
+     | Some correct_res -> correct_res
+     | None ->
+       dfs_process true TIdMap.empty entry_blk initial_offset)
+  in
+
+
+  let initial_offset = (RspOffset initial_cfa_rsp_offset, RbpUndef) in
+  (* Try first without rbp, then with rbp upon failure *)
+  let changes_map = with_rbp_if_needed initial_offset in
+
+  let merged_changes = TIdMap.fold
+      (fun _ (cfa_changes, _) accu -> AddrMap.union (fun addr v1 v2 ->
+           match (symmetric_valid_merge v1 v2) with
+           | Valid_merge -> Some v1
+           | Invalid_merge ->
+             Format.eprintf "Inconsistency: 0x%Lx: cannot merge %a - %a@."
+               addr pp_reg_pos v1 pp_reg_pos v2 ;
+             Some (CfaLostTrack, RbpUndef)
+           | Valid_with_rbp_erasing valid_merge ->
+             Some valid_merge
+         )
+           cfa_changes accu)
+      changes_map
+      AddrMap.empty in
+
+  let reg_changes = cleanup_fde merged_changes in
+
+  let output = {
+    reg_changes_fde = reg_changes ;
+    beg_pos = first_addr ;
+    end_pos = last_addr ;
+  } in
+
+  output
+
+
+
+
