@@ -37,11 +37,14 @@ function find_ml_dwarf_write {
         echo $out
         return 0
     fi
-    for location in . "$(dirname $0)" ; do
+    for location in . "$(dirname "$BASH_SOURCE")" "$(dirname $0)" ; do
+        echo "Trying location $location" 1>&2
         out="$location/ml_dwarf_write.bin"
-        if [ -x "$out" ] ; then
+        if [ -x "$( readlink -f "$out" )" ] ; then
             echo $out
             return 0
+        else
+            echo "$out is not executable" 1>&2
         fi
     done
     return 1
@@ -63,8 +66,11 @@ function bap_synth {
 }
 
 function dwarf_write_synth {
-    $ML_DWARF_WRITE "$TMP_DIR/marshal" "$INPUT_FILE" "$TMP_DIR/eh_frame" \
-        > /dev/null
+    echo "ML_DWARF_WRITE is $ML_DWARF_WRITE" 1>&2
+#    $ML_DWARF_WRITE "$TMP_DIR/marshal" "$INPUT_FILE" "$TMP_DIR/eh_frame" \
+#        > /dev/null
+    echo "Doing: " $ML_DWARF_WRITE "$TMP_DIR/marshal" "$INPUT_FILE" "$TMP_DIR/eh_frame"
+    $ML_DWARF_WRITE "$TMP_DIR/marshal" "$INPUT_FILE" "$TMP_DIR/eh_frame"
     return $?
 }
 
@@ -76,22 +82,28 @@ function dwarf_plug {
     return $?
 }
 
+ML_DWARF_WRITE=$(find_ml_dwarf_write)
+if [ $? -ne 0 ] ; then
+    echo -e "Cannot find ml_dwarf_write" 1>&2
+    exit 1
+fi
+
+
+echo "basename is $(basename -- "$0")" 1>&2
+case "$(basename -- "$0")" in
+	(synthesize_dwarf.sh)
+
 if [ "$#" -lt "1" ] ; then
     >&2 echo -e "Missing argument.\n\n$HELP_TEXT"
     exit 1
 fi
 
-ML_DWARF_WRITE=$(find_ml_dwarf_write)
-if [ "$?" -ne "0" ] ; then
-    >&2 echo -e "Cannot find ml_dwarf_write"
-    exit 1
-fi
 
 INPUT_FILE="$1"
 OUTPUT_FILE="$2"
 
 if ! [ -f "$INPUT_FILE" ] ; then
-    >&2 echo -e "$INPUT_FILE: no such file.\n\n$HELP_TEXT"
+    echo -e "$INPUT_FILE: no such file.\n\n$HELP_TEXT" 1>&2
 fi
 
 if [ -z "$OUTPUT_FILE" ] ; then
@@ -109,3 +121,12 @@ timer_probe "bap startup" \
     && timer_probe "finish"
 
 rm -rf "$TMP_DIR"
+
+;;
+
+(*)
+    echo "Set INPUT_FILE, OUTPUT_FILE and TMP_DIR before doing bap_synth" 1>&2
+    set -v
+    true
+;;
+esac
